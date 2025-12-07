@@ -230,6 +230,8 @@ class MusicService :
     @Inject
     lateinit var dlnaManager: DLNAManager
 
+    private val songUrlCache = HashMap<String, Pair<String, Long>>()
+
     private var isAudioEffectSessionOpened = false
     private var loudnessEnhancer: LoudnessEnhancer? = null
 
@@ -369,15 +371,24 @@ class MusicService :
                                 val mediaUrl = player.currentMediaItem?.localConfiguration?.uri?.toString() ?: ""
                                 
                                 if (mediaUrl.isNotEmpty()) {
-                                    val success = dlnaManager.playMedia(
-                                        mediaUrl = mediaUrl,
-                                        title = metadata?.title ?: "",
-                                        artist = metadata?.artists?.firstOrNull()?.name ?: ""
-                                    )
-                                    
-                                    if (success) {
-                                        // Pause local player
-                                        player.pause()
+                                    val resolvedUrl = try {
+                                        if (mediaUrl.startsWith("http")) mediaUrl else getStreamUrl(mediaUrl)
+                                    } catch (e: Exception) {
+                                        Log.e("MusicService", "Failed to resolve URL for DLNA", e)
+                                        null
+                                    }
+
+                                    if (resolvedUrl != null) {
+                                        val success = dlnaManager.playMedia(
+                                            mediaUrl = resolvedUrl,
+                                            title = metadata?.title ?: "",
+                                            artist = metadata?.artists?.firstOrNull()?.name ?: ""
+                                        )
+
+                                        if (success) {
+                                            // Pause local player
+                                            player.pause()
+                                        }
                                     }
                                 }
                             }
@@ -696,22 +707,39 @@ class MusicService :
      * Note: Media3 CastPlayer automatically handles playback transfer when a Cast session is available
      */
     private fun switchToCastPlayer() {
-        val currentPlayer = player
-        val playWhenReady = currentPlayer.playWhenReady
-        val currentPosition = currentPlayer.currentPosition
-        val currentMediaItemIndex = currentPlayer.currentMediaItemIndex
-        val currentMediaItems = currentPlayer.mediaItems.toList()
-        
-        castPlayer?.let { cast ->
-            // Transfer state to cast player
-            cast.setMediaItems(currentMediaItems, currentMediaItemIndex, currentPosition)
-            cast.playWhenReady = playWhenReady
-            cast.prepare()
-            
-            // Pause local player to avoid concurrent playback
-            player.pause()
-            
-            Log.d("MusicService", "Transferred playback to Cast player")
+        val playWhenReady = player.playWhenReady
+        val currentPosition = player.currentPosition
+        val currentMediaItemIndex = player.currentMediaItemIndex
+        val currentMediaItems = player.mediaItems.toList()
+
+        scope.launch {
+            castPlayer?.let { cast ->
+                // Resolve the current media item's URL
+                val resolvedMediaItems = currentMediaItems.mapIndexed { index, item ->
+                    if (index == currentMediaItemIndex) {
+                        try {
+                            val mediaId = item.mediaId
+                            val streamUrl = getStreamUrl(mediaId)
+                            item.buildUpon().setUri(streamUrl).build()
+                        } catch (e: Exception) {
+                            Log.e("MusicService", "Failed to resolve URL for Cast", e)
+                            item
+                        }
+                    } else {
+                        item
+                    }
+                }
+
+                // Transfer state to cast player
+                cast.setMediaItems(resolvedMediaItems, currentMediaItemIndex, currentPosition)
+                cast.playWhenReady = playWhenReady
+                cast.prepare()
+
+                // Pause local player to avoid concurrent playback
+                player.pause()
+
+                Log.d("MusicService", "Transferred playback to Cast player")
+            }
         }
     }
     
@@ -1246,18 +1274,27 @@ class MusicService :
                     
                     if (mediaUrl.isNotEmpty()) {
                         Log.d("MusicService", "Streaming to DLNA device: ${selectedDevice.name}")
-                        val success = dlnaManager.playMedia(
-                            mediaUrl = mediaUrl,
-                            title = metadata?.title ?: "",
-                            artist = metadata?.artists?.firstOrNull()?.name ?: ""
-                        )
-                        
-                        if (success) {
-                            // Pause local player when streaming to DLNA
-                            player.pause()
-                            Log.d("MusicService", "Successfully started DLNA playback")
-                        } else {
-                            Log.e("MusicService", "Failed to start DLNA playback")
+                        val resolvedUrl = try {
+                            if (mediaUrl.startsWith("http")) mediaUrl else getStreamUrl(mediaUrl)
+                        } catch (e: Exception) {
+                            Log.e("MusicService", "Failed to resolve URL for DLNA", e)
+                            null
+                        }
+
+                        if (resolvedUrl != null) {
+                            val success = dlnaManager.playMedia(
+                                mediaUrl = resolvedUrl,
+                                title = metadata?.title ?: "",
+                                artist = metadata?.artists?.firstOrNull()?.name ?: ""
+                            )
+
+                            if (success) {
+                                // Pause local player when streaming to DLNA
+                                player.pause()
+                                Log.d("MusicService", "Successfully started DLNA playback")
+                            } else {
+                                Log.e("MusicService", "Failed to start DLNA playback")
+                            }
                         }
                     }
                 }
@@ -1537,8 +1574,78 @@ class MusicService :
             ).setCacheWriteDataSinkFactory(null)
             .setFlags(FLAG_IGNORE_CACHE_ON_ERROR)
 
+    private suspend fun getStreamUrl(mediaId: String): String {
+        // Check if we have a valid cached URL (not expired)
+        songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let {
+            scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
+            return it.first
+        }
+
+        // Need to fetch a new URL - either first time or URL expired
+        val playbackData = YTPlayerUtils.playerResponseForPlayback(
+            mediaId,
+            audioQuality = audioQuality,
+            connectivityManager = connectivityManager,
+        ).getOrElse { throwable ->
+            when (throwable) {
+                is PlaybackException -> throw throwable
+
+                is java.net.ConnectException, is java.net.UnknownHostException -> {
+                    throw PlaybackException(
+                        getString(R.string.error_no_internet),
+                        throwable,
+                        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED
+                    )
+                }
+
+                is java.net.SocketTimeoutException -> {
+                    throw PlaybackException(
+                        getString(R.string.error_timeout),
+                        throwable,
+                        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
+                    )
+                }
+
+                else -> throw PlaybackException(
+                    getString(R.string.error_unknown),
+                    throwable,
+                    PlaybackException.ERROR_CODE_REMOTE_ERROR
+                )
+            }
+        }
+
+        val nonNullPlayback = requireNotNull(playbackData) {
+            getString(R.string.error_unknown)
+        }
+
+        val format = nonNullPlayback.format
+
+        database.query {
+            upsert(
+                FormatEntity(
+                    id = mediaId,
+                    itag = format.itag,
+                    mimeType = format.mimeType.split(";")[0],
+                    codecs = format.mimeType.split("codecs=")[1].removeSurrounding("\""),
+                    bitrate = format.bitrate,
+                    sampleRate = format.audioSampleRate,
+                    contentLength = format.contentLength ?: 0L,
+                    loudnessDb = nonNullPlayback.audioConfig?.loudnessDb,
+                    playbackUrl = nonNullPlayback.playbackTracking?.videostatsPlaybackUrl?.baseUrl
+                )
+            )
+        }
+        scope.launch(Dispatchers.IO) { recoverSong(mediaId, nonNullPlayback) }
+
+        val streamUrl = nonNullPlayback.streamUrl
+
+        songUrlCache[mediaId] =
+            streamUrl to System.currentTimeMillis() + (nonNullPlayback.streamExpiresInSeconds * 1000L)
+
+        return streamUrl
+    }
+
     private fun createDataSourceFactory(): DataSource.Factory {
-        val songUrlCache = HashMap<String, Pair<String, Long>>()
         return ResolvingDataSource.Factory(createCacheDataSource()) { dataSpec ->
             val mediaId = dataSpec.key ?: run {
                 Log.e("MusicService", "DataSpec has no media id key")
@@ -1560,76 +1667,12 @@ class MusicService :
                 return@Factory dataSpec
             }
 
-            // Check if we have a valid cached URL (not expired)
-            songUrlCache[mediaId]?.takeIf { it.second > System.currentTimeMillis() }?.let {
-                scope.launch(Dispatchers.IO) { recoverSong(mediaId) }
-                return@Factory dataSpec.withUri(it.first.toUri())
+            // Get stream URL (blocking for DataSource)
+            val streamUrl = runBlocking(Dispatchers.IO) {
+                getStreamUrl(mediaId)
             }
 
-            // Need to fetch a new URL - either first time or URL expired
-            val playbackData = runBlocking(Dispatchers.IO) {
-                YTPlayerUtils.playerResponseForPlayback(
-                    mediaId,
-                    audioQuality = audioQuality,
-                    connectivityManager = connectivityManager,
-                )
-            }.getOrElse { throwable ->
-                when (throwable) {
-                    is PlaybackException -> throw throwable
-
-                    is java.net.ConnectException, is java.net.UnknownHostException -> {
-                        throw PlaybackException(
-                            getString(R.string.error_no_internet),
-                            throwable,
-                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED
-                        )
-                    }
-
-                    is java.net.SocketTimeoutException -> {
-                        throw PlaybackException(
-                            getString(R.string.error_timeout),
-                            throwable,
-                            PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
-                        )
-                    }
-
-                    else -> throw PlaybackException(
-                        getString(R.string.error_unknown),
-                        throwable,
-                        PlaybackException.ERROR_CODE_REMOTE_ERROR
-                    )
-                }
-            }
-
-            val nonNullPlayback = requireNotNull(playbackData) {
-                getString(R.string.error_unknown)
-            }
-            run {
-                val format = nonNullPlayback.format
-
-                database.query {
-                    upsert(
-                        FormatEntity(
-                            id = mediaId,
-                            itag = format.itag,
-                            mimeType = format.mimeType.split(";")[0],
-                            codecs = format.mimeType.split("codecs=")[1].removeSurrounding("\""),
-                            bitrate = format.bitrate,
-                            sampleRate = format.audioSampleRate,
-                            contentLength = format.contentLength ?: 0L,
-                            loudnessDb = nonNullPlayback.audioConfig?.loudnessDb,
-                            playbackUrl = nonNullPlayback.playbackTracking?.videostatsPlaybackUrl?.baseUrl
-                        )
-                    )
-                }
-                scope.launch(Dispatchers.IO) { recoverSong(mediaId, nonNullPlayback) }
-
-                val streamUrl = nonNullPlayback.streamUrl
-
-                songUrlCache[mediaId] =
-                    streamUrl to System.currentTimeMillis() + (nonNullPlayback.streamExpiresInSeconds * 1000L)
-                return@Factory dataSpec.withUri(streamUrl.toUri())
-            }
+            return@Factory dataSpec.withUri(streamUrl.toUri())
         }
     }
 
