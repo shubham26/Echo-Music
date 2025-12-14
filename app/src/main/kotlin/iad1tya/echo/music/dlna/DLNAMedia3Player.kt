@@ -7,6 +7,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.SimpleBasePlayer
 import androidx.media3.common.Timeline
+import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import iad1tya.echo.music.models.MediaMetadata
 import kotlinx.coroutines.CoroutineScope
@@ -203,13 +204,13 @@ class DLNAMedia3Player(
             // Polling will update the actual state
         }
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleSetRepeatMode(repeatMode: Int): ListenableFuture<*> {
         repeatModeInternal = repeatMode
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleSetShuffleModeEnabled(shuffleModeEnabled: Boolean): ListenableFuture<*> {
@@ -220,7 +221,7 @@ class DLNAMedia3Player(
             shuffledIndices = emptyList()
         }
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handlePrepare(): ListenableFuture<*> {
@@ -231,7 +232,7 @@ class DLNAMedia3Player(
             }
         }
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleStop(): ListenableFuture<*> {
@@ -243,7 +244,7 @@ class DLNAMedia3Player(
         }
         stopPolling()
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleSeek(
@@ -270,7 +271,7 @@ class DLNAMedia3Player(
         }
 
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleSetMediaItems(
@@ -295,7 +296,7 @@ class DLNAMedia3Player(
         }
 
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleAddMediaItems(
@@ -311,7 +312,7 @@ class DLNAMedia3Player(
             updateShuffledIndices()
         }
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleRemoveMediaItems(fromIndex: Int, toIndex: Int): ListenableFuture<*> {
@@ -335,14 +336,14 @@ class DLNAMedia3Player(
             updateShuffledIndices()
         }
         invalidateState()
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     override fun handleSetVolume(volume: Float): ListenableFuture<*> {
         scope.launch {
             dlnaManager.setVolume((volume * 100).toInt())
         }
-        return futures.immediateVoidFuture()
+        return Futures.immediateVoidFuture()
     }
 
     private suspend fun prepareAndPlayCurrent() {
