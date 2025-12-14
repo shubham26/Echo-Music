@@ -8,7 +8,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.launch
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -133,6 +132,14 @@ class DLNAManager @Inject constructor(
     
     suspend fun setVolume(volume: Int): Boolean {
         return currentPlayer?.setVolume(volume.coerceIn(0, 100)) ?: false
+    }
+
+    suspend fun getPositionInfo(): DLNAPlayer.PositionInfo? {
+        return currentPlayer?.getPositionInfo()
+    }
+
+    suspend fun getTransportInfo(): DLNAPlayer.TransportInfo? {
+        return currentPlayer?.getTransportInfo()
     }
     
     private fun buildMetadata(title: String, artist: String): String {

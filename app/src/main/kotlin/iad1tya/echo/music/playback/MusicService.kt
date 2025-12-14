@@ -97,6 +97,7 @@ import iad1tya.echo.music.db.entities.RelatedSongMap
 import iad1tya.echo.music.di.DownloadCache
 import iad1tya.echo.music.di.PlayerCache
 import iad1tya.echo.music.dlna.DLNAManager
+import iad1tya.echo.music.dlna.DLNAMedia3Player
 import iad1tya.echo.music.extensions.SilentHandler
 import iad1tya.echo.music.extensions.collect
 import iad1tya.echo.music.extensions.collectLatest
@@ -226,9 +227,10 @@ class MusicService :
     private var castContext: CastContext? = null
     private var isCastSessionAvailable = false
     
-    // DLNA/UPnP support (placeholder)
+    // DLNA/UPnP support
     @Inject
     lateinit var dlnaManager: DLNAManager
+    private var dlnaPlayer: DLNAMedia3Player? = null
 
     private var isAudioEffectSessionOpened = false
     private var loudnessEnhancer: LoudnessEnhancer? = null
@@ -242,9 +244,9 @@ class MusicService :
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         intent?.action?.let { action ->
             when (action) {
-                ACTION_PLAY_PAUSE -> if (player.isPlaying) player.pause() else player.play()
-                ACTION_NEXT -> if (player.hasNextMediaItem()) player.seekToNext()
-                ACTION_PREVIOUS -> if (player.hasPreviousMediaItem()) player.seekToPrevious()
+                ACTION_PLAY_PAUSE -> if (mediaSession.player.isPlaying) mediaSession.player.pause() else mediaSession.player.play()
+                ACTION_NEXT -> if (mediaSession.player.hasNextMediaItem()) mediaSession.player.seekToNext()
+                ACTION_PREVIOUS -> if (mediaSession.player.hasPreviousMediaItem()) mediaSession.player.seekToPrevious()
             }
         }
 
@@ -359,10 +361,25 @@ class MusicService :
             castPlayer = null
         }
         
-        // Initialize DLNA (placeholder for future full implementation)
+        // Initialize DLNA
         try {
             if (::dlnaManager.isInitialized) {
                 dlnaManager.start()
+                dlnaPlayer = DLNAMedia3Player(mainLooper, dlnaManager)
+                dlnaPlayer?.onResolveUrl = { mediaItem ->
+                    try {
+                        val mediaId = mediaItem.mediaId
+                        val playbackData = YTPlayerUtils.playerResponseForPlayback(
+                            videoId = mediaId,
+                            audioQuality = audioQuality,
+                            connectivityManager = connectivityManager
+                        ).getOrNull()
+                        playbackData?.streamUrl
+                    } catch (e: Exception) {
+                        Log.e("MusicService", "Failed to resolve URL for DLNA", e)
+                        null
+                    }
+                }
                 Log.d("MusicService", "DLNA service initialized")
                 
                 // Monitor DLNA device selection changes
@@ -370,29 +387,12 @@ class MusicService :
                     dlnaManager.selectedDevice.collect { device ->
                         if (device != null) {
                             Log.d("MusicService", "DLNA device selected: ${device.name}")
-                            // If currently playing, stream to DLNA device
-                            if (player.playbackState == Player.STATE_READY && player.currentMediaItem != null) {
-                                val metadata = currentMediaMetadata.value
-                                val mediaUrl = player.currentMediaItem?.localConfiguration?.uri?.toString() ?: ""
-                                
-                                if (mediaUrl.isNotEmpty()) {
-                                    val success = dlnaManager.playMedia(
-                                        mediaUrl = mediaUrl,
-                                        title = metadata?.title ?: "",
-                                        artist = metadata?.artists?.firstOrNull()?.name ?: ""
-                                    )
-                                    
-                                    if (success) {
-                                        // Pause local player
-                                        player.pause()
-                                    }
-                                }
-                            }
+                            switchToDLNAPlayer()
                         } else {
-                            Log.d("MusicService", "DLNA device deselected, resuming local playback")
-                            // Resume local playback if it was paused for DLNA
-                            if (player.playbackState == Player.STATE_READY && !player.playWhenReady) {
-                                player.play()
+                            Log.d("MusicService", "DLNA device deselected")
+                            // Switch back to local player if we were using DLNA player
+                            if (mediaSession.player == dlnaPlayer) {
+                                switchToLocalPlayer()
                             }
                         }
                     }
@@ -438,9 +438,9 @@ class MusicService :
                 if (isConnected && waitingForNetworkConnection.value) {
                     // Simple auto-play logic like OuterTune
                     waitingForNetworkConnection.value = false
-                    if (player.currentMediaItem != null && player.playWhenReady) {
-                        player.prepare()
-                        player.play()
+                    if (mediaSession.player.currentMediaItem != null && mediaSession.player.playWhenReady) {
+                        mediaSession.player.prepare()
+                        mediaSession.player.play()
                     }
                 }
             }
@@ -533,13 +533,13 @@ class MusicService :
                 // Restore player settings after queue is loaded
                 scope.launch {
                     delay(1000) // Wait for queue to be loaded
-                    player.repeatMode = playerState.repeatMode
-                    player.shuffleModeEnabled = playerState.shuffleModeEnabled
-                    player.volume = playerState.volume
+                    mediaSession.player.repeatMode = playerState.repeatMode
+                    mediaSession.player.shuffleModeEnabled = playerState.shuffleModeEnabled
+                    mediaSession.player.volume = playerState.volume
 
                     // Restore position if it's still valid
-                    if (playerState.currentMediaItemIndex < player.mediaItemCount) {
-                        player.seekTo(playerState.currentMediaItemIndex, playerState.currentPosition)
+                    if (playerState.currentMediaItemIndex < mediaSession.player.mediaItemCount) {
+                        mediaSession.player.seekTo(playerState.currentMediaItemIndex, playerState.currentPosition)
                     }
                 }
             }
@@ -559,7 +559,7 @@ class MusicService :
         scope.launch {
             while (isActive) {
                 delay(10.seconds)
-                if (dataStore.get(PersistentQueueKey, true) && player.isPlaying) {
+                if (dataStore.get(PersistentQueueKey, true) && mediaSession.player.isPlaying) {
                     saveQueueToDisk()
                 }
             }
@@ -583,134 +583,48 @@ class MusicService :
         }
     }
 
-    private fun setupAudioFocusRequest() {
-        audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-            .setAudioAttributes(
-                android.media.AudioAttributes.Builder()
-                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
-                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
-            .setOnAudioFocusChangeListener { focusChange ->
-                handleAudioFocusChange(focusChange)
-            }
-            .setAcceptsDelayedFocusGain(true)
-            .build()
-    }
+    private fun switchToDLNAPlayer() {
+        val currentPlayer = mediaSession.player
+        if (currentPlayer == dlnaPlayer) return
 
-    private fun handleAudioFocusChange(focusChange: Int) {
-        when (focusChange) {
-            AudioManager.AUDIOFOCUS_GAIN -> {
-                hasAudioFocus = true
+        val playWhenReady = currentPlayer.playWhenReady
+        val currentPosition = currentPlayer.currentPosition
+        val currentIndex = currentPlayer.currentMediaItemIndex
+        val items = mutableListOf<MediaItem>()
+        for (i in 0 until currentPlayer.mediaItemCount) {
+            items.add(currentPlayer.getMediaItemAt(i))
+        }
 
-                if (wasPlayingBeforeAudioFocusLoss) {
-                    player.play()
-                    wasPlayingBeforeAudioFocusLoss = false
-                }
+        dlnaPlayer?.let { dlna ->
+            // Pause current player
+            currentPlayer.pause()
 
-                player.volume = playerVolume.value
+            // Sync state
+            dlna.setPlaylist(items, currentIndex, currentPosition)
+            dlna.volume = currentPlayer.volume
+            dlna.repeatMode = currentPlayer.repeatMode
+            dlna.shuffleModeEnabled = currentPlayer.shuffleModeEnabled
 
-                lastAudioFocusState = focusChange
-            }
+            // Update MediaSession
+            mediaSession.player = dlna
 
-            AudioManager.AUDIOFOCUS_LOSS -> {
-                hasAudioFocus = false
-                wasPlayingBeforeAudioFocusLoss = false
-
-                if (player.isPlaying) {
-                    player.pause()
-                }
-
-                abandonAudioFocus()
-
-                lastAudioFocusState = focusChange
+            if (playWhenReady) {
+                dlna.play()
             }
 
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                hasAudioFocus = false
-                wasPlayingBeforeAudioFocusLoss = player.isPlaying
-
-                if (player.isPlaying) {
-                    player.pause()
-                }
-
-                lastAudioFocusState = focusChange
-            }
-
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-
-                hasAudioFocus = false
-
-                wasPlayingBeforeAudioFocusLoss = player.isPlaying
-
-                if (player.isPlaying) {
-                    player.volume = (playerVolume.value * 0.2f)
-                }
-
-                lastAudioFocusState = focusChange
-            }
-
-            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT -> {
-
-                hasAudioFocus = true
-
-                if (wasPlayingBeforeAudioFocusLoss) {
-                    player.play()
-                    wasPlayingBeforeAudioFocusLoss = false
-                }
-
-                player.volume = playerVolume.value
-
-                lastAudioFocusState = focusChange
-            }
-
-            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> {
-                hasAudioFocus = true
-
-                player.volume = playerVolume.value
-
-                lastAudioFocusState = focusChange
-            }
+            Log.d("MusicService", "Transferred playback to DLNA player")
         }
     }
 
-    private fun requestAudioFocus(): Boolean {
-        if (hasAudioFocus) return true
-
-        audioFocusRequest?.let { request ->
-            val result = audioManager.requestAudioFocus(request)
-            hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-            return hasAudioFocus
-        }
-        return false
-    }
-
-    private fun abandonAudioFocus() {
-        if (hasAudioFocus) {
-            audioFocusRequest?.let { request ->
-                audioManager.abandonAudioFocusRequest(request)
-                hasAudioFocus = false
-            }
-        }
-    }
-
-    fun hasAudioFocusForPlayback(): Boolean {
-        return hasAudioFocus
-    }
-    
-    /**
-     * Switch playback to Google Cast device
-     * Note: Media3 CastPlayer automatically handles playback transfer when a Cast session is available
-     */
     private fun switchToCastPlayer() {
-        val currentPlayer = player
+        val currentPlayer = mediaSession.player
         val playWhenReady = currentPlayer.playWhenReady
         val currentPosition = currentPlayer.currentPosition
         val currentMediaItem = currentPlayer.currentMediaItem ?: return
         
         castPlayer?.let { cast ->
             // Update mode to avoid conflicts
-            player.pause()
+            currentPlayer.pause()
 
             // Update MediaSession and sync volume
             mediaSession.player = cast
@@ -759,28 +673,25 @@ class MusicService :
         }
     }
     
-    /**
-     * Switch playback back to local ExoPlayer
-     */
     private fun switchToLocalPlayer() {
-        val cast = castPlayer ?: run {
-            Log.w("MusicService", "Attempted to switch from Cast player but castPlayer is null")
-            return
-        }
+        val currentPlayer = mediaSession.player
+        if (currentPlayer == player) return
         
         try {
-            val playWhenReady = cast.playWhenReady
-            val currentPosition = cast.currentPosition
-            
-            // Note: We can't transfer the queue back easily if we only played one song
-            // Ideally we would sync the state. For now, we resume the local player where it left off
-            // or at the cast position if valid.
+            val playWhenReady = currentPlayer.playWhenReady
+            val currentPosition = currentPlayer.currentPosition
+            val currentIndex = currentPlayer.currentMediaItemIndex
             
             // Update MediaSession to use local Player
             mediaSession.player = player
 
-            // Stop cast player
-            cast.stop()
+            // Stop remote player
+            currentPlayer.stop()
+
+            // Sync local player
+            if (currentIndex != C.INDEX_UNSET && currentIndex < player.mediaItemCount) {
+                player.seekTo(currentIndex, currentPosition)
+            }
             
             // Resume local player
             if (playWhenReady) {
@@ -885,7 +796,7 @@ class MusicService :
     ) {
         val song = database.song(mediaId).first()
         val mediaMetadata = withContext(Dispatchers.Main) {
-            player.findNextMediaItemById(mediaId)?.metadata
+            mediaSession.player.findNextMediaItemById(mediaId)?.metadata
         } ?: return
         val duration = song?.song?.duration?.takeIf { it != -1 }
             ?: mediaMetadata.duration.takeIf { it != -1 }
@@ -923,35 +834,35 @@ class MusicService :
         if (!scope.isActive) scope = CoroutineScope(Dispatchers.Main) + Job()
         currentQueue = queue
         queueTitle = null
-        player.shuffleModeEnabled = false
+        player.shuffleModeEnabled = false // Reset shuffle on local player
         if (queue.preloadItem != null) {
-            player.setMediaItem(queue.preloadItem!!.toMediaItem())
-            player.prepare()
-            player.playWhenReady = playWhenReady
+            mediaSession.player.setMediaItem(queue.preloadItem!!.toMediaItem())
+            mediaSession.player.prepare()
+            mediaSession.player.playWhenReady = playWhenReady
         }
         scope.launch(SilentHandler) {
             val initialStatus =
                 withContext(Dispatchers.IO) {
                     queue.getInitialStatus().filterExplicit(dataStore.get(HideExplicitKey, false))
                 }
-            if (queue.preloadItem != null && player.playbackState == STATE_IDLE) return@launch
+            if (queue.preloadItem != null && mediaSession.player.playbackState == STATE_IDLE) return@launch
             if (initialStatus.title != null) {
                 queueTitle = initialStatus.title
             }
             if (initialStatus.items.isEmpty()) return@launch
             if (queue.preloadItem != null) {
-                player.addMediaItems(
+                mediaSession.player.addMediaItems(
                     0,
                     initialStatus.items.subList(0, initialStatus.mediaItemIndex)
                 )
-                player.addMediaItems(
+                mediaSession.player.addMediaItems(
                     initialStatus.items.subList(
                         initialStatus.mediaItemIndex + 1,
                         initialStatus.items.size
                     )
                 )
             } else {
-                player.setMediaItems(
+                mediaSession.player.setMediaItems(
                     initialStatus.items,
                     if (initialStatus.mediaItemIndex >
                         0
@@ -962,19 +873,23 @@ class MusicService :
                     },
                     initialStatus.position,
                 )
-                player.prepare()
-                player.playWhenReady = playWhenReady
+                mediaSession.player.prepare()
+                mediaSession.player.playWhenReady = playWhenReady
             }
         }
     }
 
     fun startRadioSeamlessly() {
-        val currentMediaMetadata = player.currentMetadata ?: return
+        val currentMediaMetadata = mediaSession.player.currentMetadata ?: return
 
         // Save current song
-        val currentSong = player.currentMediaItem
+        val currentSong = mediaSession.player.currentMediaItem
 
         // Remove other songs from queue
+        // Note: this logic assumes local player for now.
+        // If remote, queue manipulation might not be fully supported.
+        // But mediaSession.player calls should delegate correctly if supported.
+        val player = mediaSession.player
         if (player.currentMediaItemIndex > 0) {
             player.removeMediaItems(0, player.currentMediaItemIndex)
         }
@@ -1010,7 +925,7 @@ class MusicService :
 
     fun getAutomix(playlistId: String) {
         if (dataStore[SimilarContent] == true &&
-            !(dataStore.get(DisableLoadMoreWhenRepeatAllKey, false) && player.repeatMode == REPEAT_MODE_ALL)) {
+            !(dataStore.get(DisableLoadMoreWhenRepeatAllKey, false) && mediaSession.player.repeatMode == REPEAT_MODE_ALL)) {
             scope.launch(SilentHandler) {
                 YouTube
                     .next(WatchEndpoint(playlistId = playlistId))
@@ -1055,6 +970,7 @@ class MusicService :
     }
 
     fun playNext(items: List<MediaItem>) {
+        val player = mediaSession.player
         // If queue is empty or player is idle, play immediately instead
         if (player.mediaItemCount == 0 || player.playbackState == STATE_IDLE) {
             player.setMediaItems(items)
@@ -1124,8 +1040,8 @@ class MusicService :
     }
 
     fun addToQueue(items: List<MediaItem>) {
-        player.addMediaItems(items)
-        player.prepare()
+        mediaSession.player.addMediaItems(items)
+        mediaSession.player.prepare()
     }
 
     private fun toggleLibrary() {
@@ -1167,6 +1083,12 @@ class MusicService :
     }
 
     private fun setupLoudnessEnhancer() {
+        // LoudnessEnhancer only works on local ExoPlayer
+        if (mediaSession.player != player) {
+            releaseLoudnessEnhancer()
+            return
+        }
+
         val audioSessionId = player.audioSessionId
 
         if (audioSessionId == C.AUDIO_SESSION_ID_UNSET || audioSessionId <= 0) {
@@ -1283,51 +1205,21 @@ class MusicService :
             // Player is ready
         }
         
-        // Stream to DLNA device if selected
-        scope.launch {
-            try {
-                val selectedDevice = dlnaManager.selectedDevice.value
-                if (selectedDevice != null && mediaItem != null) {
-                    val metadata = currentMediaMetadata.value
-                    val mediaUrl = mediaItem.localConfiguration?.uri?.toString() ?: ""
-                    
-                    if (mediaUrl.isNotEmpty()) {
-                        Log.d("MusicService", "Streaming to DLNA device: ${selectedDevice.name}")
-                        val success = dlnaManager.playMedia(
-                            mediaUrl = mediaUrl,
-                            title = metadata?.title ?: "",
-                            artist = metadata?.artists?.firstOrNull()?.name ?: ""
-                        )
-                        
-                        if (success) {
-                            // Pause local player when streaming to DLNA
-                            player.pause()
-                            Log.d("MusicService", "Successfully started DLNA playback")
-                        } else {
-                            Log.e("MusicService", "Failed to start DLNA playback")
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("MusicService", "Error streaming to DLNA: ${e.message}", e)
-            }
-        }
-        
         // Update widget
         updateWidget()
 
         // Auto load more songs
         if (dataStore.get(AutoLoadMoreKey, true) &&
             reason != Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT &&
-            player.mediaItemCount - player.currentMediaItemIndex <= 5 &&
+            mediaSession.player.mediaItemCount - mediaSession.player.currentMediaItemIndex <= 5 &&
             currentQueue.hasNextPage() &&
-            !(dataStore.get(DisableLoadMoreWhenRepeatAllKey, false) && player.repeatMode == REPEAT_MODE_ALL)
+            !(dataStore.get(DisableLoadMoreWhenRepeatAllKey, false) && mediaSession.player.repeatMode == REPEAT_MODE_ALL)
         ) {
             scope.launch(SilentHandler) {
                 val mediaItems =
                     currentQueue.nextPage().filterExplicit(dataStore.get(HideExplicitKey, false))
-                if (player.playbackState != STATE_IDLE) {
-                    player.addMediaItems(mediaItems.drop(1))
+                if (mediaSession.player.playbackState != STATE_IDLE) {
+                    mediaSession.player.addMediaItems(mediaItems.drop(1))
                 }
             }
         }
@@ -1353,29 +1245,6 @@ class MusicService :
         // Reset consecutive error counter when playback is successful
         if (playbackState == Player.STATE_READY) {
             consecutivePlaybackErr = 0
-        }
-        
-        // Sync DLNA playback state
-        scope.launch {
-            try {
-                val selectedDevice = dlnaManager.selectedDevice.value
-                if (selectedDevice != null) {
-                    when (playbackState) {
-                        Player.STATE_READY -> {
-                            if (player.playWhenReady) {
-                                dlnaManager.resume()
-                            } else {
-                                dlnaManager.pause()
-                            }
-                        }
-                        Player.STATE_ENDED -> {
-                            dlnaManager.stopPlayback()
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("MusicService", "Error syncing DLNA state: ${e.message}", e)
-            }
         }
         
         // Update widget
@@ -1419,15 +1288,19 @@ class MusicService :
         updateNotification()
         if (shuffleModeEnabled) {
             // If queue is empty, don't shuffle
-            if (player.mediaItemCount == 0) return
+            if (mediaSession.player.mediaItemCount == 0) return
 
-            // Always put current playing item at first
-            val shuffledIndices = IntArray(player.mediaItemCount) { it }
-            shuffledIndices.shuffle()
-            shuffledIndices[shuffledIndices.indexOf(player.currentMediaItemIndex)] =
-                shuffledIndices[0]
-            shuffledIndices[0] = player.currentMediaItemIndex
-            player.setShuffleOrder(DefaultShuffleOrder(shuffledIndices, System.currentTimeMillis()))
+            // Note: If using DLNA player, shuffle might not be supported or behaves differently.
+            // For local player:
+            if (mediaSession.player == player) {
+                // Always put current playing item at first
+                val shuffledIndices = IntArray(player.mediaItemCount) { it }
+                shuffledIndices.shuffle()
+                shuffledIndices[shuffledIndices.indexOf(player.currentMediaItemIndex)] =
+                    shuffledIndices[0]
+                shuffledIndices[0] = player.currentMediaItemIndex
+                player.setShuffleOrder(DefaultShuffleOrder(shuffledIndices, System.currentTimeMillis()))
+            }
         }
 
         // Save state when shuffle mode changes
@@ -1463,7 +1336,7 @@ class MusicService :
         
         try {
         // Attempt to recover from cache corruption by clearing cache and retrying
-        val mediaId = player.currentMediaItem?.mediaId
+        val mediaId = mediaSession.player.currentMediaItem?.mediaId
         if (mediaId != null && !isNetworkConnected.value.not()) { // Only try if we have network to refetch
              val isCached = try {
                  playerCache.isCached(mediaId, 0, 1) || downloadCache.isCached(mediaId, 0, 1)
@@ -1479,12 +1352,12 @@ class MusicService :
                      }
                      withContext(Dispatchers.Main) {
                          // Retry playback
-                         val currentIndex = player.currentMediaItemIndex
-                         val currentPosition = player.currentPosition
-                         if (currentIndex >= 0 && currentIndex < player.mediaItemCount) {
-                            player.seekTo(currentIndex, currentPosition)
-                            player.prepare()
-                            player.play()
+                         val currentIndex = mediaSession.player.currentMediaItemIndex
+                         val currentPosition = mediaSession.player.currentPosition
+                         if (currentIndex >= 0 && currentIndex < mediaSession.player.mediaItemCount) {
+                            mediaSession.player.seekTo(currentIndex, currentPosition)
+                            mediaSession.player.prepare()
+                            mediaSession.player.play()
                          }
                      }
                  }
@@ -1508,19 +1381,19 @@ class MusicService :
         
         // If URL expired, try to refresh and continue playback automatically
         if (isUrlExpiredError) {
-            val currentPosition = player.currentPosition
-            val currentIndex = player.currentMediaItemIndex
+            val currentPosition = mediaSession.player.currentPosition
+            val currentIndex = mediaSession.player.currentMediaItemIndex
             
             scope.launch {
                 try {
                     delay(300) // Brief delay before retry
                     
                     // Re-prepare the player which will force URL refresh
-                    if (currentIndex >= 0 && currentIndex < player.mediaItemCount) {
+                    if (currentIndex >= 0 && currentIndex < mediaSession.player.mediaItemCount) {
                         // Seek to current position and retry
-                        player.seekTo(currentIndex, currentPosition.coerceAtLeast(0))
-                        player.prepare()
-                        player.play()
+                        mediaSession.player.seekTo(currentIndex, currentPosition.coerceAtLeast(0))
+                        mediaSession.player.prepare()
+                        mediaSession.player.play()
                         
                         // Reset error counter on successful retry
                         consecutivePlaybackErr = 0
@@ -1547,7 +1420,7 @@ class MusicService :
             reportException(e)
             // Fallback: just stop the player
             try {
-                player.pause()
+                mediaSession.player.pause()
             } catch (fallbackError: Exception) {
                 Log.e("MusicService", "Failed to pause player in fallback", fallbackError)
             }
@@ -1847,6 +1720,8 @@ class MusicService :
         } catch (e: Exception) {
             Log.e("MusicService", "Failed to stop DLNA: ${e.message}")
         }
+        dlnaPlayer?.release()
+        dlnaPlayer = null
         
         super.onDestroy()
     }
@@ -1860,13 +1735,13 @@ class MusicService :
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo) = mediaSession
     
     private fun updateWidget() {
-        val metadata = player.currentMetadata
+        val metadata = mediaSession.player.currentMetadata
         MusicWidgetProvider.updateWidget(
             context = this,
             songTitle = metadata?.title,
             artistName = metadata?.artists?.joinToString(", ") { it.name },
             albumArtUrl = metadata?.thumbnailUrl,
-            isPlaying = player.isPlaying
+            isPlaying = mediaSession.player.isPlaying
         )
     }
 
