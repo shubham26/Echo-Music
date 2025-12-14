@@ -7,19 +7,16 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.SimpleBasePlayer
 import androidx.media3.common.Timeline
-import androidx.media3.datasource.ResolvingDataSource
-import com.echo.innertube.models.SongItem
+import com.google.common.util.concurrent.ListenableFuture
 import iad1tya.echo.music.models.MediaMetadata
-import iad1tya.echo.music.utils.YTPlayerUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.util.Collections
 
 class DLNAMedia3Player(
     looper: Looper,
@@ -44,6 +41,8 @@ class DLNAMedia3Player(
     private var pollingJob: Job? = null
     private var autoPlayNextJob: Job? = null
 
+    var onResolveUrl: (suspend (MediaItem) -> String?)? = null
+
     init {
         // Monitor device selection to stop playback if disconnected
         scope.launch {
@@ -66,6 +65,10 @@ class DLNAMedia3Player(
 
         updateTimeline()
 
+        if (shuffleModeEnabledInternal) {
+            updateShuffledIndices()
+        }
+
         // Don't auto-start here, let MusicService call play() or prepare()
     }
 
@@ -74,11 +77,14 @@ class DLNAMedia3Player(
          playlist.addAll(items)
          currentMediaItemIndex = if (items.isNotEmpty()) currentIndex.coerceIn(0, items.lastIndex) else C.INDEX_UNSET
          updateTimeline()
+         if (shuffleModeEnabledInternal) {
+             updateShuffledIndices()
+         }
          invalidateState()
     }
 
-    override fun getState(): State {
-        return State.Builder()
+    override fun getState(): SimpleBasePlayer.State {
+        return SimpleBasePlayer.State.Builder()
             .setAvailableCommands(
                 Player.Commands.Builder()
                     .addAll(
@@ -133,7 +139,7 @@ class DLNAMedia3Player(
                     }
 
                     return window.set(
-                        Window.uid(windowIndex),
+                        windowIndex,
                         mediaItem,
                         null,
                         C.TIME_UNSET,
@@ -174,6 +180,14 @@ class DLNAMedia3Player(
         }
     }
 
+    private fun updateShuffledIndices() {
+        if (playlist.isNotEmpty()) {
+            shuffledIndices = playlist.indices.shuffled()
+        } else {
+            shuffledIndices = emptyList()
+        }
+    }
+
     override fun handleSetPlayWhenReady(playWhenReady: Boolean): ListenableFuture<*> {
         playWhenReadyInternal = playWhenReady
         scope.launch {
@@ -201,14 +215,7 @@ class DLNAMedia3Player(
     override fun handleSetShuffleModeEnabled(shuffleModeEnabled: Boolean): ListenableFuture<*> {
         shuffleModeEnabledInternal = shuffleModeEnabled
         if (shuffleModeEnabled) {
-            // Create a shuffled list of indices
-            if (playlist.isNotEmpty()) {
-                shuffledIndices = playlist.indices.shuffled()
-                // Ensure current song is not immediately repeated if possible,
-                // or just leave it as is.
-                // Ideally, current playing song should be first in shuffled order if we were reordering,
-                // but here we just use shuffledIndices for navigation.
-            }
+            updateShuffledIndices()
         } else {
             shuffledIndices = emptyList()
         }
@@ -283,6 +290,10 @@ class DLNAMedia3Player(
             currentPositionMs = 0
         }
 
+        if (shuffleModeEnabledInternal) {
+            updateShuffledIndices()
+        }
+
         invalidateState()
         return futures.immediateVoidFuture()
     }
@@ -296,6 +307,9 @@ class DLNAMedia3Player(
             currentMediaItemIndex += mediaItems.size
         }
         updateTimeline()
+        if (shuffleModeEnabledInternal) {
+            updateShuffledIndices()
+        }
         invalidateState()
         return futures.immediateVoidFuture()
     }
@@ -317,6 +331,9 @@ class DLNAMedia3Player(
         }
 
         updateTimeline()
+        if (shuffleModeEnabledInternal) {
+            updateShuffledIndices()
+        }
         invalidateState()
         return futures.immediateVoidFuture()
     }
@@ -335,63 +352,14 @@ class DLNAMedia3Player(
 
         // Resolve URL if needed (YouTube IDs need resolving)
         val uri = mediaItem.localConfiguration?.uri
-        var streamUrl = uri.toString()
 
         // Very basic check if it's a YouTube ID (no scheme) or valid URL
         if (uri?.scheme == null) {
-            // Assume it's a media ID that needs resolving
-             try {
-                // We need context to access YTPlayerUtils or connectivity manager
-                // But this class doesn't have them easily.
-                // However, MusicService passed resolved items usually?
-                // MusicService `switchToCastPlayer` resolves URL.
-                // We should probably rely on `MusicService` to resolve or do it here.
-                // Since `DLNAMedia3Player` is created in `MusicService`, we can inject dependencies?
-                // Or we can rely on `MusicService` resolving it before setting MediaItem.
-                // But `MusicService` sets media items from Queue which has IDs.
-
-                // Let's assume for now we need to resolve it if it doesn't look like a URL
-                // But `YTPlayerUtils` requires `ConnectivityManager`.
-                // Let's pass `Context` to `DLNAMedia3Player`.
-             } catch (e: Exception) {
-                 Log.e(TAG, "Failed to resolve URL", e)
-                 return
-             }
+             // Let the resolveAndPlay handle it or callback
         }
 
-        // NOTE: MusicService uses `ResolvingDataSource` which resolves on the fly.
-        // But DLNA needs a real URL.
-        // We really should resolve it here.
-        // But I don't have easy access to `YTPlayerUtils` here without more deps.
-        // Let's check `MusicService.switchToCastPlayer` again. It resolves URL explicitly.
-
-        // I will assume for now that I need to resolve it.
-        // I'll make `prepareAndPlayCurrent` call a callback or just try to play.
-        // If it fails, `MusicService` logic for handling playback errors might kick in?
-        // No, `SimpleBasePlayer` error handling is different.
-
-        // Since I cannot easily add `YTPlayerUtils` here without significant refactoring or passing deps,
-        // I will add a method `playMediaItem(item: MediaItem)` that `MusicService` can override or use?
-        // No, `MusicService` treats this as a `Player`.
-
-        // Solution: `MusicService` sets the player. `MusicService` should probably handle URL resolution for external players.
-        // But `MusicService` calls `setMediaItems` with standard items.
-        // `CastPlayer` has a `MediaItemConverter`.
-
-        // I will use `MusicService`'s existing resolving logic by calling back?
-        // Or simply: `MusicService` should be modified to resolving URL before `setMediaItems` for DLNA?
-        // No, queue management becomes hard.
-
-        // I'll just assume I can pass the media ID to `DLNAManager`? No, `DLNAManager` expects URL.
-
-        // Let's implement basic resolving here if possible, or add a callback.
-        // Actually, `MusicService` `switchToCastPlayer` resolves ONLY current song.
-        // So for DLNA, we should do same.
-
-        // I will add a callback to `DLNAMedia3Player` constructor for resolving URL.
+        resolveAndPlay()
     }
-
-    var onResolveUrl: (suspend (MediaItem) -> String?)? = null
 
     private suspend fun resolveAndPlay() {
         val mediaItem = playlist.getOrNull(currentMediaItemIndex) ?: return
@@ -518,6 +486,6 @@ class DLNAMedia3Player(
              dlnaManager.stopPlayback()
         }
         stopPolling()
-        // cancel scope?
+        scope.cancel()
     }
 }

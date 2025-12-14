@@ -583,6 +583,121 @@ class MusicService :
         }
     }
 
+    private fun setupAudioFocusRequest() {
+        audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                android.media.AudioAttributes.Builder()
+                    .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                    .setContentType(android.media.AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener { focusChange ->
+                handleAudioFocusChange(focusChange)
+            }
+            .setAcceptsDelayedFocusGain(true)
+            .build()
+    }
+
+    private fun handleAudioFocusChange(focusChange: Int) {
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                hasAudioFocus = true
+
+                if (wasPlayingBeforeAudioFocusLoss) {
+                    player.play()
+                    wasPlayingBeforeAudioFocusLoss = false
+                }
+
+                player.volume = playerVolume.value
+
+                lastAudioFocusState = focusChange
+            }
+
+            AudioManager.AUDIOFOCUS_LOSS -> {
+                hasAudioFocus = false
+                wasPlayingBeforeAudioFocusLoss = false
+
+                if (player.isPlaying) {
+                    player.pause()
+                }
+
+                abandonAudioFocus()
+
+                lastAudioFocusState = focusChange
+            }
+
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                hasAudioFocus = false
+                wasPlayingBeforeAudioFocusLoss = player.isPlaying
+
+                if (player.isPlaying) {
+                    player.pause()
+                }
+
+                lastAudioFocusState = focusChange
+            }
+
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+
+                hasAudioFocus = false
+
+                wasPlayingBeforeAudioFocusLoss = player.isPlaying
+
+                if (player.isPlaying) {
+                    player.volume = (playerVolume.value * 0.2f)
+                }
+
+                lastAudioFocusState = focusChange
+            }
+
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT -> {
+
+                hasAudioFocus = true
+
+                if (wasPlayingBeforeAudioFocusLoss) {
+                    player.play()
+                    wasPlayingBeforeAudioFocusLoss = false
+                }
+
+                player.volume = playerVolume.value
+
+                lastAudioFocusState = focusChange
+            }
+
+            AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK -> {
+                hasAudioFocus = true
+
+                player.volume = playerVolume.value
+
+                lastAudioFocusState = focusChange
+            }
+        }
+    }
+
+    private fun requestAudioFocus(): Boolean {
+        if (hasAudioFocus) return true
+
+        audioFocusRequest?.let { request ->
+            val result = audioManager.requestAudioFocus(request)
+            hasAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            return hasAudioFocus
+        }
+        return false
+    }
+
+    private fun abandonAudioFocus() {
+        if (hasAudioFocus) {
+            audioFocusRequest?.let { request ->
+                audioManager.abandonAudioFocusRequest(request)
+                hasAudioFocus = false
+            }
+        }
+    }
+
+    fun hasAudioFocusForPlayback(): Boolean {
+        return hasAudioFocus
+    }
+
     private fun switchToDLNAPlayer() {
         val currentPlayer = mediaSession.player
         if (currentPlayer == dlnaPlayer) return
@@ -988,53 +1103,56 @@ class MusicService :
 
         if (shuffleEnabled) {
             // Rebuild shuffle order so that newly inserted items are played next
-            val timeline = player.currentTimeline
-            if (!timeline.isEmpty) {
-                val size = timeline.windowCount
-                val currentIndex = player.currentMediaItemIndex
+            // Only apply custom shuffle order if player supports it (ExoPlayer)
+            if (player is ExoPlayer) {
+                val timeline = player.currentTimeline
+                if (!timeline.isEmpty) {
+                    val size = timeline.windowCount
+                    val currentIndex = player.currentMediaItemIndex
 
-                // Newly inserted indices are a contiguous range [insertIndex, insertIndex + items.size)
-                val newIndices = (insertIndex until (insertIndex + items.size)).toSet()
+                    // Newly inserted indices are a contiguous range [insertIndex, insertIndex + items.size)
+                    val newIndices = (insertIndex until (insertIndex + items.size)).toSet()
 
-                // Collect existing shuffle traversal order excluding current index
-                val orderAfter = mutableListOf<Int>()
-                var idx = currentIndex
-                while (true) {
-                    idx = timeline.getNextWindowIndex(idx, Player.REPEAT_MODE_OFF, /*shuffleModeEnabled=*/true)
-                    if (idx == C.INDEX_UNSET) break
-                    if (idx != currentIndex) orderAfter.add(idx)
-                }
+                    // Collect existing shuffle traversal order excluding current index
+                    val orderAfter = mutableListOf<Int>()
+                    var idx = currentIndex
+                    while (true) {
+                        idx = timeline.getNextWindowIndex(idx, Player.REPEAT_MODE_OFF, /*shuffleModeEnabled=*/true)
+                        if (idx == C.INDEX_UNSET) break
+                        if (idx != currentIndex) orderAfter.add(idx)
+                    }
 
-                val prevList = mutableListOf<Int>()
-                var pIdx = currentIndex
-                while (true) {
-                    pIdx = timeline.getPreviousWindowIndex(pIdx, Player.REPEAT_MODE_OFF, /*shuffleModeEnabled=*/true)
-                    if (pIdx == C.INDEX_UNSET) break
-                    if (pIdx != currentIndex) prevList.add(pIdx)
-                }
-                prevList.reverse() // preserve original forward order
+                    val prevList = mutableListOf<Int>()
+                    var pIdx = currentIndex
+                    while (true) {
+                        pIdx = timeline.getPreviousWindowIndex(pIdx, Player.REPEAT_MODE_OFF, /*shuffleModeEnabled=*/true)
+                        if (pIdx == C.INDEX_UNSET) break
+                        if (pIdx != currentIndex) prevList.add(pIdx)
+                    }
+                    prevList.reverse() // preserve original forward order
 
-                val existingOrder = (prevList + orderAfter).filter { it != currentIndex && it !in newIndices }
+                    val existingOrder = (prevList + orderAfter).filter { it != currentIndex && it !in newIndices }
 
-                // Build new shuffle order: current -> newly inserted (in insertion order) -> rest
-                val nextBlock = (insertIndex until (insertIndex + items.size)).toList()
-                val finalOrder = IntArray(size)
-                var pos = 0
-                finalOrder[pos++] = currentIndex
-                nextBlock.forEach { if (it in 0 until size) finalOrder[pos++] = it }
-                existingOrder.forEach { if (pos < size) finalOrder[pos++] = it }
+                    // Build new shuffle order: current -> newly inserted (in insertion order) -> rest
+                    val nextBlock = (insertIndex until (insertIndex + items.size)).toList()
+                    val finalOrder = IntArray(size)
+                    var pos = 0
+                    finalOrder[pos++] = currentIndex
+                    nextBlock.forEach { if (it in 0 until size) finalOrder[pos++] = it }
+                    existingOrder.forEach { if (pos < size) finalOrder[pos++] = it }
 
-                // Fill any missing indices (safety) to ensure a full permutation
-                if (pos < size) {
-                    for (i in 0 until size) {
-                        if (!finalOrder.contains(i)) {
-                            finalOrder[pos++] = i
-                            if (pos == size) break
+                    // Fill any missing indices (safety) to ensure a full permutation
+                    if (pos < size) {
+                        for (i in 0 until size) {
+                            if (!finalOrder.contains(i)) {
+                                finalOrder[pos++] = i
+                                if (pos == size) break
+                            }
                         }
                     }
-                }
 
-                player.setShuffleOrder(DefaultShuffleOrder(finalOrder, System.currentTimeMillis()))
+                    player.setShuffleOrder(DefaultShuffleOrder(finalOrder, System.currentTimeMillis()))
+                }
             }
         }
     }
@@ -1263,22 +1381,29 @@ class MusicService :
         player: Player,
         events: Player.Events,
     ) {
-        if (events.containsAny(
-                Player.EVENT_PLAYBACK_STATE_CHANGED,
-                Player.EVENT_PLAY_WHEN_READY_CHANGED
-            )
-        ) {
-            val isBufferingOrReady =
-                player.playbackState == Player.STATE_BUFFERING || player.playbackState == Player.STATE_READY
-            if (isBufferingOrReady && player.playWhenReady) {
-                val focusGranted = requestAudioFocus()
-                if (focusGranted) {
-                    openAudioEffectSession()
+        // Only handle audio focus for the local player (ExoPlayer)
+        // DLNA players and Cast players handle their own focus/routing externally or don't need it
+        if (player == this.player) {
+            if (events.containsAny(
+                    Player.EVENT_PLAYBACK_STATE_CHANGED,
+                    Player.EVENT_PLAY_WHEN_READY_CHANGED
+                )
+            ) {
+                val isBufferingOrReady =
+                    player.playbackState == Player.STATE_BUFFERING || player.playbackState == Player.STATE_READY
+                if (isBufferingOrReady && player.playWhenReady) {
+                    val focusGranted = requestAudioFocus()
+                    if (focusGranted) {
+                        openAudioEffectSession()
+                    }
+                } else {
+                    // Don't abandon focus here immediately as it might be a short pause or transition
+                    // Focus is abandoned in handleAudioFocusChange on LOSS or onDestroy/stop
+                    closeAudioEffectSession()
                 }
-            } else {
-                closeAudioEffectSession()
             }
         }
+
         if (events.containsAny(EVENT_TIMELINE_CHANGED, EVENT_POSITION_DISCONTINUITY)) {
             currentMediaMetadata.value = player.currentMetadata
         }
